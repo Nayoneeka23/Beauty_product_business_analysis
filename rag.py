@@ -1,5 +1,7 @@
 import pandas as pd
 from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
 # Load Sephora product dataset
 df = pd.read_csv("Dataset/product_info.csv")
 
@@ -46,7 +48,7 @@ Rating: {safe_text(row['rating'])}
 Reviews: {safe_text(row['reviews'])}
 Customer Loves: {safe_text(row['loves_count'])}
 Highlights: {safe_text(row['highlights'])}
-Ingredients: {safe_text(row['ingredients'])}
+Ingredients: {safe_text(row['ingredients'])[:1000]}
 """.strip()
 
 
@@ -77,3 +79,28 @@ embeddings = embedding_model.encode(
 )
 
 print("\nEmbedding shape:", embeddings.shape)
+
+# ---------------------------------------------------------
+# Build FAISS vector index
+# ---------------------------------------------------------
+
+# FAISS expects float32 vectors
+embeddings = np.asarray(
+    embeddings,
+    dtype="float32"
+)
+
+# Each embedding has 384 dimensions
+dimension = embeddings.shape[1]
+
+# Create FAISS index
+# Since embeddings are normalized, inner product acts as cosine similarity
+index = faiss.IndexFlatIP(dimension)
+
+# Add all product embeddings to the index
+index.add(embeddings)
+faiss.write_index(index, "sephora_products.index")
+
+print("\nFAISS index created successfully.")
+print("Embedding dimension:", dimension)
+print("Products stored in FAISS:", index.ntotal)
