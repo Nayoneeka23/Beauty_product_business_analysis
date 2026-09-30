@@ -93,71 +93,146 @@ print("Products stored in FAISS:", index.ntotal)
 
 
 # ---------------------------------------------------------
-# 6. Retrieve relevant products using FAISS
+# 6. Retrieve relevant products + apply filters
 # ---------------------------------------------------------
 
-def retrieve_products(query, k=5):
+def retrieve_products(
+    query,
+    max_price=None,
+    min_rating=None,
+    brand=None,
+    final_k=5,
+    candidate_k=200
+):
 
-    # Convert user's question into an embedding
+    # Convert user question into embedding
     query_embedding = embedding_model.encode(
         [query],
         normalize_embeddings=True
     )
 
-    # FAISS expects float32 vectors
     query_embedding = np.asarray(
         query_embedding,
         dtype="float32"
     )
 
-    # Find the most similar products
+    # Retrieve a larger semantic candidate pool
     scores, indices = index.search(
         query_embedding,
-        k
+        candidate_k
     )
 
-    # Retrieve corresponding product information
     results = products.iloc[
         indices[0]
     ].copy()
 
-    # Add similarity scores
     results["similarity_score"] = scores[0]
+
+    # -----------------------------------------------------
+    # Brand filter
+    # -----------------------------------------------------
+
+    if brand is not None:
+
+        results = results[
+            results["brand_name"]
+            .fillna("")
+            .str.strip()
+            .str.lower()
+            == brand.strip().lower()
+        ]
+
+    # -----------------------------------------------------
+    # Maximum price filter
+    # -----------------------------------------------------
+
+    if max_price is not None:
+
+        results = results[
+            results["price_usd"].notna()
+            & (results["price_usd"] <= max_price)
+        ]
+
+    # -----------------------------------------------------
+    # Minimum rating filter
+    # -----------------------------------------------------
+
+    if min_rating is not None:
+
+        results = results[
+            results["rating"].notna()
+            & (results["rating"] >= min_rating)
+        ]
+
+    # Keep best semantic matches
+    results = results.head(final_k)
 
     return results
 
 
 # ---------------------------------------------------------
-# 7. Generate final answer using Mistral
+# 7. Generate answer using Mistral
 # ---------------------------------------------------------
 
-def generate_answer(query, retrieved_products):
+def generate_answer(
+    query,
+    retrieved_products,
+    max_price=None,
+    min_rating=None,
+    brand=None
+):
 
-    # Combine retrieved product documents
     context = "\n\n---\n\n".join(
         retrieved_products["document"].tolist()
     )
 
-    # Prompt given to Mistral
+    # Build description of active filters
+    filter_text = []
+
+    if brand is not None:
+        filter_text.append(
+            f"Brand: {brand}"
+        )
+
+    if max_price is not None:
+        filter_text.append(
+            f"Maximum price: ${max_price:.2f}"
+        )
+
+    if min_rating is not None:
+        filter_text.append(
+            f"Minimum rating: {min_rating}"
+        )
+
+    if filter_text:
+        filters = "\n".join(filter_text)
+    else:
+        filters = "No additional filters."
+
     prompt = f"""
 You are a beauty product recommendation assistant.
 
-Your task is to answer the user's question using ONLY the Sephora
-product information provided in the context below.
+Answer the user's question using ONLY the Sephora product information
+provided in the context below.
 
 Important rules:
 - Recommend only products present in the provided context.
 - Do not invent products.
-- Do not invent prices, ratings, ingredients, or product benefits.
-- If a rating or other information is marked "Not available",
-  do not make up a value.
-- Explain briefly why each recommended product matches the user's request.
-- If the context does not contain enough information to answer the
-  question, clearly say so.
+- Do not invent prices.
+- Do not invent ratings.
+- Do not invent ingredients.
+- Do not invent product benefits.
+- Respect all active filters.
+- If information is marked "Not available", do not invent it.
+- Explain briefly why each recommendation matches the user's request.
+- If the available information is insufficient, clearly say so.
 - Keep the answer concise and easy to understand.
 
 USER QUESTION:
 {query}
+
+ACTIVE FILTERS:
+{filters}
 
 SEPHORA PRODUCT CONTEXT:
 {context}
@@ -165,7 +240,6 @@ SEPHORA PRODUCT CONTEXT:
 ANSWER:
 """
 
-    # Send prompt to locally running Ollama
     response = requests.post(
         "http://localhost:11434/api/generate",
         json={
@@ -176,78 +250,272 @@ ANSWER:
         timeout=120
     )
 
-    # Raise an error if Ollama request failed
     response.raise_for_status()
 
-    # Return Mistral's generated answer
     return response.json()["response"]
 
 
 # ---------------------------------------------------------
-# 8. Test complete RAG pipeline
+# 8. Helper function for optional numeric filters
 # ---------------------------------------------------------
 
-query = (
-    "I have dry skin and want something hydrating. "
-    "What would you recommend?"
-)
+def get_optional_number(
+    prompt,
+    min_value=None,
+    max_value=None
+):
 
-print("\nUser question:")
-print(query)
+    while True:
+
+        value = input(prompt).strip()
+
+        # Empty input = no filter
+        if value == "":
+            return None
+
+        try:
+            number = float(value)
+
+            if (
+                min_value is not None
+                and number < min_value
+            ):
+                print(
+                    f"Please enter a value of at least "
+                    f"{min_value}."
+                )
+                continue
+
+            if (
+                max_value is not None
+                and number > max_value
+            ):
+                print(
+                    f"Please enter a value no greater "
+                    f"than {max_value}."
+                )
+                continue
+
+            return number
+
+        except ValueError:
+
+            print(
+                "Please enter a valid number "
+                "or press Enter to skip."
+            )
 
 
-# STEP 1: Retrieve products from FAISS
-results = retrieve_products(
-    query,
-    k=5
-)
+# ---------------------------------------------------------
+# 9. Helper function for brand selection
+# ---------------------------------------------------------
 
-print("\nRetrieved products:\n")
+def get_brand():
 
-print(
-    results[
-        [
-            "product_name",
-            "brand_name",
-            "primary_category",
-            "secondary_category",
-            "price_usd",
-            "rating",
-            "similarity_score"
-        ]
-    ].to_string(index=False)
-)
+    value = input(
+        "Brand (press Enter for any brand): "
+    ).strip()
 
+    # No brand filter
+    if value == "":
+        return None
 
-# STEP 2: Send retrieved information to Mistral
-print("\nGenerating answer with Mistral...\n")
+    # Find exact brand ignoring capitalization
+    matching_brands = products[
+        products["brand_name"]
+        .fillna("")
+        .str.lower()
+        == value.lower()
+    ]["brand_name"].dropna().unique()
 
-try:
+    if len(matching_brands) > 0:
+        return matching_brands[0]
 
-    answer = generate_answer(
-        query,
-        results
+    # Brand not found
+    print(
+        f"\nBrand '{value}' was not found "
+        "in the Sephora dataset."
     )
-
-    print("RAG Answer:\n")
-    print(answer)
-
-except requests.exceptions.ConnectionError:
 
     print(
-        "ERROR: Could not connect to Ollama. "
-        "Make sure Ollama is running."
+        "Continuing without a brand filter."
     )
 
-except requests.exceptions.Timeout:
+    return None
+
+
+# ---------------------------------------------------------
+# 10. Interactive RAG system
+# ---------------------------------------------------------
+
+print("\n" + "=" * 60)
+print("SEPHORA AI PRODUCT ASSISTANT")
+print("=" * 60)
+
+print("""
+Ask a question about Sephora products.
+
+Examples:
+- I have dry skin and need a moisturizer
+- Recommend a cleanser for sensitive skin
+- Suggest something for damaged hair
+- I have an oily scalp and need a shampoo
+
+Optional filters:
+- Brand
+- Maximum price
+- Minimum rating
+
+Press Enter to skip any filter.
+
+Type 'exit' to stop.
+""")
+
+
+while True:
+
+    # -----------------------------------------------------
+    # User question
+    # -----------------------------------------------------
+
+    query = input(
+        "\nAsk a Sephora product question:\n> "
+    ).strip()
+
+    if query.lower() in [
+        "exit",
+        "quit",
+        "q"
+    ]:
+        print("\nGoodbye!")
+        break
+
+    if not query:
+        print(
+            "\nPlease enter a question."
+        )
+        continue
+
+    # -----------------------------------------------------
+    # Optional filters
+    # -----------------------------------------------------
 
     print(
-        "ERROR: Mistral took too long to respond."
+        "\nOptional filters "
+        "(press Enter to skip):"
     )
 
-except requests.exceptions.RequestException as error:
+    brand = get_brand()
+
+    max_price = get_optional_number(
+        "Maximum price ($): ",
+        min_value=0
+    )
+
+    min_rating = get_optional_number(
+        "Minimum rating (0-5): ",
+        min_value=0,
+        max_value=5
+    )
+
+    # -----------------------------------------------------
+    # Retrieve + filter
+    # -----------------------------------------------------
 
     print(
-        "ERROR while communicating with Ollama:",
-        error
+        "\nSearching Sephora products..."
     )
+
+    results = retrieve_products(
+        query=query,
+        max_price=max_price,
+        min_rating=min_rating,
+        brand=brand,
+        final_k=5,
+        candidate_k=200
+    )
+
+    # -----------------------------------------------------
+    # No matches
+    # -----------------------------------------------------
+
+    if results.empty:
+
+        print(
+            "\nNo suitable products were found "
+            "for those search conditions."
+        )
+
+        print(
+            "Try changing the brand, increasing "
+            "the maximum price, lowering the "
+            "minimum rating, or changing your query."
+        )
+
+        continue
+
+    # -----------------------------------------------------
+    # Display retrieved products
+    # -----------------------------------------------------
+
+    print("\nTop retrieved products:\n")
+
+    display_columns = [
+        "product_name",
+        "brand_name",
+        "primary_category",
+        "secondary_category",
+        "price_usd",
+        "rating",
+        "similarity_score"
+    ]
+
+    print(
+        results[
+            display_columns
+        ].to_string(index=False)
+    )
+
+    # -----------------------------------------------------
+    # Generate answer using Mistral
+    # -----------------------------------------------------
+
+    print(
+        "\nGenerating AI recommendation...\n"
+    )
+
+    try:
+
+        answer = generate_answer(
+            query=query,
+            retrieved_products=results,
+            max_price=max_price,
+            min_rating=min_rating,
+            brand=brand
+        )
+
+        print("=" * 60)
+        print("SEPHORA AI RESPONSE")
+        print("=" * 60)
+
+        print("\n" + answer)
+
+    except requests.exceptions.ConnectionError:
+
+        print(
+            "\nERROR: Could not connect to Ollama. "
+            "Make sure Ollama is running."
+        )
+
+    except requests.exceptions.Timeout:
+
+        print(
+            "\nERROR: Mistral took too long to respond."
+        )
+
+    except requests.exceptions.RequestException as error:
+
+        print(
+            "\nERROR while communicating with Ollama:",
+            error
+        )
